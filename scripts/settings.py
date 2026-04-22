@@ -48,11 +48,13 @@ DETAIL_ID_DATA_ATTR_PATTERN = re.compile(
 )
 LIST_ROW_SELECTOR = "tr[data-v-6debbb14], table tbody tr"
 ATTACHMENT_EXT_PATTERN = re.compile(
-    r"\.(pdf|hwp|hwpx|docx?|xlsx?|pptx?|zip|rar|7z|txt|csv|jpg|jpeg|png|gif|bmp)(?:$|\\?)",
+    # Python raw regex에서는 \?만 literal 물음표가 되므로, 쿼리 문자열 구분도 정확히 잡도록 수정한다.
+    r"\.(pdf|hwp|hwpx|docx?|xlsx?|pptx?|zip|rar|7z|txt|csv|jpg|jpeg|png|gif|bmp)(?:$|\?)",
     re.IGNORECASE,
 )
 IMAGE_EXT_PATTERN = re.compile(
-    r"\.(jpg|jpeg|png|gif|bmp|webp|svg)(?:$|\\?)",
+    # 이미지 URL도 .jpgx 같은 오탐을 막기 위해 동일한 종료 조건을 사용한다.
+    r"\.(jpg|jpeg|png|gif|bmp|webp|svg)(?:$|\?)",
     re.IGNORECASE,
 )
 CONTENT_TYPE_OVERRIDES = {

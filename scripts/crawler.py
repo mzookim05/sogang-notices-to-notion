@@ -69,6 +69,7 @@ def run_attachment_policy_selftest() -> None:
     keys = ("ATTACHMENT_ALLOWED_DOMAINS",)
     original_env = {key: os.environ.get(key) for key in keys}
     os.environ["ATTACHMENT_ALLOWED_DOMAINS"] = "sogang.ac.kr"
+    notion_upload_backup = None
     try:
         html = (
             '<div>첨부파일</div>'
@@ -103,6 +104,110 @@ def run_attachment_policy_selftest() -> None:
                 len(page_attachments),
             )
             raise RuntimeError("첨부파일 정책 셀프테스트 실패")
+        # 본문 image/embed 경로도 allowlist와 업로드 결과가 해시에 반영되는지 함께 확인한다.
+        import notion_client as notion_client_module
+        from notion_client import prepare_body_blocks_for_sync
+        from utils import compute_body_hash, normalize_body_blocks_for_hash
+
+        notion_upload_backup = notion_client_module.upload_external_file_to_notion
+
+        def fake_upload_success(
+            token: str,
+            url: str,
+            filename: str,
+            expect_image: bool = False,
+            filename_hint: Optional[str] = None,
+        ) -> Optional[str]:
+            suffix = "image" if expect_image else "file"
+            return f"{suffix}-{filename}"
+
+        notion_client_module.upload_external_file_to_notion = fake_upload_success
+        allowed_blocks = [
+            {
+                "object": "block",
+                "type": "image",
+                "image": {
+                    "type": "external",
+                    "external": {
+                        "url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg"
+                    },
+                    "caption": [{"type": "text", "text": {"content": "sample"}}],
+                },
+            },
+            {
+                "object": "block",
+                "type": "embed",
+                "embed": {
+                    "url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.pdf?sg=test.pdf"
+                },
+            },
+        ]
+        prepared_blocks, prepared_hash_blocks = prepare_body_blocks_for_sync(
+            "selftest-token", allowed_blocks
+        )
+        desired_hash = compute_body_hash(
+            normalize_body_blocks_for_hash(allowed_blocks, True),
+            image_mode="upload-files-v1",
+        )
+        actual_hash = compute_body_hash(
+            prepared_hash_blocks,
+            image_mode="upload-files-v1",
+        )
+        if (
+            prepared_blocks[0].get("image", {}).get("type") != "file_upload"
+            or prepared_blocks[1].get("type") != "pdf"
+            or desired_hash != actual_hash
+        ):
+            raise RuntimeError("본문 업로드 셀프테스트 실패(allowlist/hash)")
+
+        def fake_upload_partial(
+            token: str,
+            url: str,
+            filename: str,
+            expect_image: bool = False,
+            filename_hint: Optional[str] = None,
+        ) -> Optional[str]:
+            if url.endswith("test.pdf?sg=test.pdf"):
+                return None
+            suffix = "image" if expect_image else "file"
+            return f"{suffix}-{filename}"
+
+        notion_client_module.upload_external_file_to_notion = fake_upload_partial
+        partial_blocks, partial_hash_blocks = prepare_body_blocks_for_sync(
+            "selftest-token", allowed_blocks
+        )
+        partial_hash = compute_body_hash(
+            partial_hash_blocks,
+            image_mode="upload-files-v1",
+        )
+        if (
+            partial_blocks[0].get("image", {}).get("type") != "file_upload"
+            or partial_blocks[1].get("type") != "embed"
+            or partial_hash == desired_hash
+        ):
+            raise RuntimeError("본문 업로드 셀프테스트 실패(부분 실패 재시도)")
+
+        notion_client_module.upload_external_file_to_notion = fake_upload_success
+        blocked_blocks = [
+            {
+                "object": "block",
+                "type": "image",
+                "image": {
+                    "type": "external",
+                    "external": {"url": "https://example.com/test.jpg"},
+                },
+            },
+            {
+                "object": "block",
+                "type": "embed",
+                "embed": {"url": "https://example.com/test.pdf"},
+            },
+        ]
+        blocked_prepared, blocked_hash_blocks = prepare_body_blocks_for_sync(
+            "selftest-token", blocked_blocks
+        )
+        if blocked_prepared != blocked_blocks or blocked_hash_blocks != blocked_blocks:
+            raise RuntimeError("본문 업로드 셀프테스트 실패(차단 URL 유지)")
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
@@ -133,6 +238,10 @@ def run_attachment_policy_selftest() -> None:
                 raise RuntimeError("첨부파일 정책 셀프테스트 실패(Playwright)")
         LOGGER.info("첨부파일 정책 셀프테스트 통과")
     finally:
+        if notion_upload_backup is not None:
+            import notion_client as notion_client_module
+
+            notion_client_module.upload_external_file_to_notion = notion_upload_backup
         for key, value in original_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -296,12 +405,35 @@ def fetch_bbs_detail(pk_id: str, config_fk: Optional[str] = None) -> Optional[di
     return detail
 
 
+# 상세 API가 200을 돌려줘도 핵심 필드가 비면 HTML 보완 조회를 태워서 조용한 부분 실패를 줄인다.
+def get_detail_html_fallback_reason(detail: Optional[dict]) -> Optional[str]:
+    if detail is None:
+        return "api_missing"
+    if not isinstance(detail, dict):
+        return "api_invalid"
+    reasons: list[str] = []
+    if not normalize_title_key(str(detail.get("title") or "")):
+        reasons.append("title_missing")
+    if not parse_compact_datetime(detail.get("regDate")):
+        reasons.append("date_missing")
+    content_html = str(detail.get("content") or "")
+    if not content_html or not detect_body_has_content(content_html):
+        reasons.append("body_missing")
+    attachments = extract_attachments_from_api_data(detail)
+    if not attachments and content_html and ATTACHMENT_LINK_PATTERN.search(content_html):
+        reasons.append("attachment_missing")
+    if not reasons:
+        return None
+    return ",".join(reasons)
+
+
 def fetch_detail_metadata_with_html_fallback(
     pk_id: str,
     detail_url: str,
+    reason: str,
 ) -> tuple[Optional[str], list[dict], list[dict], str]:
-    # 상세 API가 비었을 때는 항목 단위 HTML 폴백을 시도해 부분 실패가 조용히 성공 처리되지 않게 한다.
-    LOGGER.warning("상세 API 로드 실패: %s -> HTML 폴백 시도", pk_id)
+    # 단순 API 미응답과 부분 성공을 로그에서 구분할 수 있게 폴백 사유를 함께 남긴다.
+    LOGGER.warning("상세 API 보완 조회: %s (%s) -> HTML 폴백 시도", pk_id, reason)
     written_at, attachments, body_blocks, _signals = fetch_detail_metadata_from_url(detail_url)
     if written_at or attachments or body_blocks:
         LOGGER.info(
@@ -311,9 +443,11 @@ def fetch_detail_metadata_with_html_fallback(
             len(attachments),
             len(body_blocks),
         )
-        return written_at, attachments, body_blocks, "html_fallback"
+        status = "html_fallback" if reason == "api_missing" else "html_fallback_partial"
+        return written_at, attachments, body_blocks, status
     LOGGER.warning("상세 HTML 폴백 실패: %s (%s)", pk_id, detail_url)
-    return None, [], [], "detail_missing"
+    status = "detail_missing" if reason == "api_missing" else "detail_incomplete"
+    return None, [], [], status
 
 
 def extract_attachments_from_api_data(data: dict) -> list[dict]:
@@ -581,14 +715,19 @@ def crawl_top_items_api(
             fallback_written_at: Optional[str] = None
             fallback_attachments: list[dict] = []
             fallback_body_blocks: list[dict] = []
-            if detail is None:
-                detail = {}
+            fallback_reason = get_detail_html_fallback_reason(detail)
+            if fallback_reason:
+                detail = detail if isinstance(detail, dict) else {}
                 (
                     fallback_written_at,
                     fallback_attachments,
                     fallback_body_blocks,
                     detail_fetch_status,
-                ) = fetch_detail_metadata_with_html_fallback(pk_id, detail_url)
+                ) = fetch_detail_metadata_with_html_fallback(
+                    pk_id,
+                    detail_url,
+                    fallback_reason,
+                )
 
             title = normalize_title_key(detail.get("title") or entry.get("title") or "")
             author = detail.get("userName") or entry.get("userName") or entry.get("userNickName") or ""

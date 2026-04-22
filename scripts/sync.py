@@ -14,8 +14,8 @@ from notion_client import (
     archive_page,
     delete_block,
     list_block_children,
-    notion_request,
     query_database,
+    query_database_page,
     update_page,
 )
 from settings import (
@@ -303,11 +303,11 @@ def dedupe_pages(
     )
     return primary
 def iter_database_pages(token: str, database_id: str) -> list[dict]:
-    url = f"https://api.notion.com/v1/databases/{database_id}/query"
     payload: dict = {"page_size": 100}
     results: list[dict] = []
     while True:
-        data = notion_request("POST", url, token, payload)
+        # 시작 중복 정리도 실제 운영 쿼리와 같은 재확인 경로를 타도록 맞춘다.
+        data = query_database_page(token, database_id, payload)
         results.extend(data.get("results", []))
         if not data.get("has_more"):
             break
@@ -441,14 +441,14 @@ def find_existing_page(
                 return primary
     return None
 def iter_top_pages(token: str, database_id: str):
-    url = f"https://api.notion.com/v1/databases/{database_id}/query"
     payload = {
         "filter": {"property": TOP_PROPERTY, "checkbox": {"equals": True}},
         "page_size": 100,
     }
 
     while True:
-        data = notion_request("POST", url, token, payload)
+        # TOP 정리도 DB 조회 실패 유형을 동일한 기준으로 해석할 수 있게 공통 helper를 사용한다.
+        data = query_database_page(token, database_id, payload)
         for page in data.get("results", []):
             yield page
         if not data.get("has_more"):

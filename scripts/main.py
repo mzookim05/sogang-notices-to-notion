@@ -221,32 +221,58 @@ def main() -> None:
                         image_mode = ""
                         if upload_files and has_image_blocks(body_blocks):
                             image_mode = BODY_HASH_IMAGE_MODE_UPLOAD
-                        hash_blocks = normalize_body_blocks_for_hash(body_blocks, upload_files)
-                        body_hash = compute_body_hash(hash_blocks, image_mode=image_mode)
-                        if body_hash != existing_hash:
-                            blocks_for_sync = prepare_body_blocks_for_sync(
+                        # 먼저 "원하는 최종 상태" 해시를 계산해, 이미 반영된 본문이면 불필요한 업로드 시도 자체를 건너뛴다.
+                        desired_hash_blocks = normalize_body_blocks_for_hash(
+                            body_blocks, upload_files
+                        )
+                        desired_body_hash = compute_body_hash(
+                            desired_hash_blocks, image_mode=image_mode
+                        )
+                        if desired_body_hash != existing_hash:
+                            blocks_for_sync, actual_hash_blocks = prepare_body_blocks_for_sync(
                                 notion_token, body_blocks
                             )
-                            sync_page_body_blocks(
-                                notion_token, page_id, blocks_for_sync, sync_mode=sync_mode
+                            actual_body_hash = compute_body_hash(
+                                actual_hash_blocks, image_mode=image_mode
                             )
-                            body_updated += 1
-                            body_state = "변경"
-                            update_page(
-                                notion_token,
-                                page_id,
-                                {
-                                    BODY_HASH_PROPERTY: {
-                                        "rich_text": [
-                                            {"type": "text", "text": {"content": body_hash}}
-                                        ]
-                                    }
-                                },
-                            )
+                            if actual_body_hash != existing_hash:
+                                sync_page_body_blocks(
+                                    notion_token,
+                                    page_id,
+                                    blocks_for_sync,
+                                    sync_mode=sync_mode,
+                                )
+                                body_updated += 1
+                                body_state = (
+                                    "변경"
+                                    if actual_body_hash == desired_body_hash
+                                    else "변경(미디어보류)"
+                                )
+                                update_page(
+                                    notion_token,
+                                    page_id,
+                                    {
+                                        BODY_HASH_PROPERTY: {
+                                            "rich_text": [
+                                                {
+                                                    "type": "text",
+                                                    "text": {"content": actual_body_hash},
+                                                }
+                                            ]
+                                        }
+                                    },
+                                )
+                            else:
+                                # 업로드 재시도를 했지만 실제 반영 상태가 바뀌지 않았다면, 다음 실행에서 다시 도전할 수 있게 유지로 남긴다.
+                                body_state = "유지(미디어재시도)"
+                                LOGGER.info(
+                                    "본문 미디어 업로드 재시도 보류: %s (원하는 상태와 아직 불일치)",
+                                    label,
+                                )
                         else:
                             body_state = "유지"
                     else:
-                        blocks_for_sync = prepare_body_blocks_for_sync(
+                        blocks_for_sync, _hash_blocks = prepare_body_blocks_for_sync(
                             notion_token, body_blocks
                         )
                         sync_page_body_blocks(

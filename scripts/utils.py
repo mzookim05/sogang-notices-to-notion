@@ -129,6 +129,35 @@ def has_image_blocks(blocks: list[dict]) -> bool:
     return False
 
 
+# 본문 해시는 file_upload id 대신 원본 URL을 기준으로 남겨야, 같은 파일을 다시 올려도 해시가 흔들리지 않는다.
+def build_uploaded_image_hash_block(
+    source_url: str,
+    caption: Optional[list[dict]] = None,
+) -> dict:
+    block = {
+        "type": "image",
+        "image": {
+            "type": "uploaded_external",
+            "source_url": source_url,
+        },
+    }
+    if caption:
+        block["image"]["caption"] = caption
+    return block
+
+
+# 파일/ PDF 업로드도 upload id가 아니라 source_url로 정규화해야 실제 sync 결과를 안정적으로 비교할 수 있다.
+def build_uploaded_file_hash_block(source_url: str, as_pdf: bool) -> dict:
+    block_type = "pdf" if as_pdf else "file"
+    return {
+        "type": block_type,
+        block_type: {
+            "type": "uploaded_external",
+            "source_url": source_url,
+        },
+    }
+
+
 def normalize_body_blocks_for_hash(
     blocks: list[dict], upload_files: bool
 ) -> list[dict]:
@@ -137,13 +166,34 @@ def normalize_body_blocks_for_hash(
     normalized: list[dict] = []
     for block in blocks:
         block_type = block.get("type")
+        if block_type == "image":
+            image = block.get("image", {})
+            url = image.get("external", {}).get("url") or ""
+            if (
+                upload_files
+                and image.get("type") == "external"
+                and url
+                and is_allowed_external_download_url(url)
+            ):
+                normalized.append(
+                    build_uploaded_image_hash_block(url, image.get("caption"))
+                )
+            else:
+                normalized.append(block)
+            continue
         if block_type == "embed":
             embed = block.get("embed", {})
             url = embed.get("url") or ""
-            if upload_files and is_embed_file_candidate(url):
+            if (
+                upload_files
+                and is_embed_file_candidate(url)
+                and is_allowed_external_download_url(url, require_file_hint=True)
+            ):
                 filename = derive_filename_from_url(url, fallback="file")
                 marker_type = "pdf" if is_pdf_name_or_url(filename, url) else "file"
-                normalized.append({ "type": marker_type, marker_type: {"source_url": url}})
+                normalized.append(
+                    build_uploaded_file_hash_block(url, as_pdf=marker_type == "pdf")
+                )
             else:
                 normalized.append(block)
             continue
@@ -345,9 +395,10 @@ def is_image_name_or_url(name: str, url: str) -> bool:
 
 
 def is_pdf_name_or_url(name: str, url: str) -> bool:
-    if re.search(r"\.pdf(?:$|\\?)", name or "", re.IGNORECASE):
+    # PDF 판별도 쿼리 문자열 앞까지만 정확히 끊어야 .pdfx 같은 오탐을 막을 수 있다.
+    if re.search(r"\.pdf(?:$|\?)", name or "", re.IGNORECASE):
         return True
-    return bool(re.search(r"\.pdf(?:$|\\?)", url or "", re.IGNORECASE))
+    return bool(re.search(r"\.pdf(?:$|\?)", url or "", re.IGNORECASE))
 
 
 def is_embed_file_candidate(url: str) -> bool:

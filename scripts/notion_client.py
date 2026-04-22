@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 import uuid
 from io import BytesIO
-from typing import Optional
+from typing import Callable, Optional, TypeVar
 from urllib.parse import urlencode, urlsplit
 
 from log import LOGGER
@@ -33,6 +33,8 @@ from utils import (
     build_file_block,
     build_pdf_block,
     build_site_headers,
+    build_uploaded_file_hash_block,
+    build_uploaded_image_hash_block,
     derive_filename_from_url,
     extract_attachment_name,
     is_allowed_external_download_url,
@@ -53,6 +55,11 @@ NOTION_TRANSIENT_BASE_DELAY_SECONDS = 1.0
 NEXT_NOTION_REQUEST_AT = 0.0
 EXTERNAL_FETCH_MAX_RETRIES = 3
 EXTERNAL_UPLOAD_MAX_RETRIES = 3
+# DB 공유 상태가 직전에 바뀌었거나 Notion이 일시적으로 object_not_found를 돌려줄 때를 대비해 같은 ID만 짧게 재확인한다.
+NOTION_DATABASE_OBJECT_NOT_FOUND_MAX_ATTEMPTS = 3
+DATABASE_OBJECT_NOT_FOUND_BASE_DELAY_SECONDS = 1.0
+
+_T = TypeVar("_T")
 
 
 class NotionRequestError(RuntimeError):
@@ -75,6 +82,45 @@ class NotionRequestError(RuntimeError):
         self.notion_code = notion_code
         self.request_id = request_id
         self.hint = hint
+
+
+def is_database_object_not_found_error(exc: NotionRequestError) -> bool:
+    return exc.status_code == 404 and exc.notion_code == "object_not_found"
+
+
+# 같은 database_id로만 재확인해서 일시적 접근 이상과 실제 설정 오류를 운영 로그에서 구분하기 쉽게 만든다.
+def run_database_request_with_object_not_found_retry(
+    request_fn: Callable[[], _T],
+    *,
+    method: str,
+    database_id: str,
+    action_name: str,
+) -> _T:
+    total_attempts = NOTION_DATABASE_OBJECT_NOT_FOUND_MAX_ATTEMPTS
+    last_exc: Optional[NotionRequestError] = None
+    for attempt in range(total_attempts):
+        try:
+            return request_fn()
+        except NotionRequestError as exc:
+            if not is_database_object_not_found_error(exc):
+                raise
+            last_exc = exc
+            if attempt + 1 >= total_attempts:
+                raise
+            sleep_s = get_database_object_not_found_retry_sleep_seconds(attempt)
+            LOGGER.warning(
+                "Notion 데이터베이스 재확인: 동작=%s, method=%s, database_id=%s, 다음 시도=%s/%s, 대기=%.1fs",
+                action_name,
+                method,
+                summarize_database_id(database_id),
+                attempt + 2,
+                total_attempts,
+                sleep_s,
+            )
+            time.sleep(sleep_s)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Notion 데이터베이스 재확인 로직이 비정상 종료되었습니다")
 
 
 # Notion 오류는 응답 JSON 형태가 일정해서, 상위 로그에 바로 도움이 되는 정보만 추려둔다.
@@ -180,6 +226,10 @@ def get_retry_sleep_seconds(
     return min(NOTION_TRANSIENT_BASE_DELAY_SECONDS * (2**attempt), 8.0)
 
 
+def get_database_object_not_found_retry_sleep_seconds(attempt: int) -> float:
+    return min(DATABASE_OBJECT_NOT_FOUND_BASE_DELAY_SECONDS * (2**attempt), 4.0)
+
+
 # 업로드 URL에 토큰 헤더를 붙일 때는 부분 문자열이 아니라 스킴과 호스트를 함께 검사해야 한다.
 def is_notion_api_url(url: str) -> bool:
     parsed = urlsplit(url)
@@ -191,6 +241,15 @@ def summarize_external_request_target(url: str) -> str:
     host = parsed.netloc or "-"
     path = parsed.path or "/"
     return f"{host}{path}"
+
+
+def summarize_database_id(database_id: str) -> str:
+    cleaned = str(database_id or "").strip()
+    if not cleaned:
+        return "-"
+    if len(cleaned) <= 12:
+        return cleaned
+    return f"{cleaned[:8]}...{cleaned[-4:]}"
 
 
 def is_retryable_http_status(status_code: int) -> bool:
@@ -710,25 +769,29 @@ def prepare_attachments_for_sync(token: str, attachments: list[dict]) -> list[di
     return updated
 
 
-def prepare_body_blocks_for_sync(token: str, blocks: list[dict]) -> list[dict]:
+def prepare_body_blocks_for_sync(token: str, blocks: list[dict]) -> tuple[list[dict], list[dict]]:
     if not blocks or not should_upload_files_to_notion():
-        return blocks
+        return blocks, blocks
     updated: list[dict] = []
+    hash_blocks: list[dict] = []
     for block in blocks:
         block_type = block.get("type")
         if block_type == "image":
             image = block.get("image", {})
             if image.get("type") != "external":
                 updated.append(block)
+                hash_blocks.append(block)
                 continue
             url = image.get("external", {}).get("url") or ""
             if not url:
                 updated.append(block)
+                hash_blocks.append(block)
                 continue
             # 본문 이미지도 첨부와 같은 allowlist를 적용해 스케줄 러너가 임의 외부 호스트를 읽지 않게 한다.
             if not is_allowed_external_download_url(url):
                 LOGGER.info("본문 이미지 업로드 스킵: 허용되지 않은 외부 URL (%s)", url)
                 updated.append(block)
+                hash_blocks.append(block)
                 continue
             filename = derive_filename_from_url(url, fallback="image")
             upload_id = upload_external_file_to_notion(
@@ -736,6 +799,8 @@ def prepare_body_blocks_for_sync(token: str, blocks: list[dict]) -> list[dict]:
             )
             if not upload_id:
                 updated.append(block)
+                # 업로드 실패 시에는 실제로 남는 external 블록 상태를 해시에 그대로 반영해야 다음 실행에서 다시 시도할 수 있다.
+                hash_blocks.append(block)
                 continue
             new_block = {
                 "object": "block",
@@ -745,17 +810,22 @@ def prepare_body_blocks_for_sync(token: str, blocks: list[dict]) -> list[dict]:
             if image.get("caption"):
                 new_block["image"]["caption"] = image["caption"]
             updated.append(new_block)
+            hash_blocks.append(
+                build_uploaded_image_hash_block(url, image.get("caption"))
+            )
             continue
         if block_type == "embed":
             embed = block.get("embed", {})
             url = embed.get("url") or ""
             if not url or not is_embed_file_candidate(url):
                 updated.append(block)
+                hash_blocks.append(block)
                 continue
             # 임베드도 도메인과 파일 신호가 둘 다 맞을 때만 내려받아 업로드한다.
             if not is_allowed_external_download_url(url, require_file_hint=True):
                 LOGGER.info("본문 임베드 업로드 스킵: 허용되지 않은 외부 URL (%s)", url)
                 updated.append(block)
+                hash_blocks.append(block)
                 continue
             filename = derive_filename_from_url(url, fallback="file")
             upload_id = upload_external_file_to_notion(
@@ -763,23 +833,38 @@ def prepare_body_blocks_for_sync(token: str, blocks: list[dict]) -> list[dict]:
             )
             if not upload_id:
                 updated.append(block)
+                # 업로드 실패 시에는 실제 결과가 embed 유지이므로 해시도 같은 상태로 남긴다.
+                hash_blocks.append(block)
                 continue
             if is_pdf_name_or_url(filename, url):
                 updated.append(build_pdf_block(upload_id))
+                hash_blocks.append(build_uploaded_file_hash_block(url, as_pdf=True))
             else:
                 updated.append(build_file_block(upload_id))
+                hash_blocks.append(build_uploaded_file_hash_block(url, as_pdf=False))
             continue
         updated.append(block)
-    return updated
+        hash_blocks.append(block)
+    return updated, hash_blocks
 def fetch_database(token: str, database_id: str) -> dict:
     url = f"https://api.notion.com/v1/databases/{database_id}"
-    return notion_request("GET", url, token)
+    return run_database_request_with_object_not_found_retry(
+        lambda: notion_request("GET", url, token),
+        method="GET",
+        database_id=database_id,
+        action_name="데이터베이스 조회",
+    )
 
 
 def update_database(token: str, database_id: str, properties: dict) -> dict:
     url = f"https://api.notion.com/v1/databases/{database_id}"
     payload = {"properties": properties}
-    return notion_request("PATCH", url, token, payload)
+    return run_database_request_with_object_not_found_retry(
+        lambda: notion_request("PATCH", url, token, payload),
+        method="PATCH",
+        database_id=database_id,
+        action_name="데이터베이스 속성 수정",
+    )
 
 
 def ensure_title_property(token: str, database_id: str, database: dict) -> dict:
@@ -1008,10 +1093,19 @@ def ensure_select_options_batch(
 
 
 def query_database(token: str, database_id: str, filter_payload: dict) -> list[dict]:
-    url = f"https://api.notion.com/v1/databases/{database_id}/query"
     payload = {"filter": filter_payload}
-    data = notion_request("POST", url, token, payload)
+    data = query_database_page(token, database_id, payload)
     return data.get("results", [])
+
+
+def query_database_page(token: str, database_id: str, payload: dict) -> dict:
+    url = f"https://api.notion.com/v1/databases/{database_id}/query"
+    return run_database_request_with_object_not_found_retry(
+        lambda: notion_request("POST", url, token, payload),
+        method="POST",
+        database_id=database_id,
+        action_name="데이터베이스 쿼리",
+    )
 
 
 def append_block_children(token: str, block_id: str, children: list[dict]) -> dict:
