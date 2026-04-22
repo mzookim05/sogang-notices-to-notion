@@ -2,6 +2,7 @@ import json
 import os
 import re
 import socket
+import time
 import urllib.error
 import urllib.request
 from html import unescape
@@ -9,6 +10,14 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlencode, urlparse
 
+from common import (
+    ensure_item_title,
+    extract_detail_id_from_text,
+    extract_detail_url_from_row_html,
+    extract_list_rows,
+    get_browser_launcher,
+    is_detail_url,
+)
 from log import LOGGER
 from bbs_parser import (
     detect_body_has_content,
@@ -16,12 +25,9 @@ from bbs_parser import (
     extract_attachments_from_page,
     extract_body_blocks_from_html,
     extract_detail_id_from_row,
-    extract_detail_id_from_text,
     extract_written_at_from_detail,
     extract_written_at_from_page,
-    is_detail_url,
     parse_rows,
-    ensure_item_title,
 )
 from settings import (
     ATTACHMENT_LINK_PATTERN,
@@ -55,6 +61,8 @@ from utils import (
     parse_int,
     replace_body_image_urls,
 )
+
+SITE_FETCH_MAX_RETRIES = 3
 
 def run_attachment_policy_selftest() -> None:
     LOGGER.info("첨부파일 정책 셀프테스트 시작")
@@ -154,25 +162,101 @@ def cap_attachments(attachments: list[dict], label: str) -> list[dict]:
         )
         return attachments[:max_count]
     return attachments
-def fetch_site_json(url: str) -> Optional[dict]:
-    req = urllib.request.Request(url, headers=build_site_headers())
+
+
+def parse_retry_after_seconds(raw_value: Optional[str]) -> Optional[float]:
+    if raw_value is None:
+        return None
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read()
+        seconds = float(str(raw_value).strip())
+    except ValueError:
+        return None
+    return max(0.0, seconds)
+
+
+def is_retryable_site_status(status_code: int) -> bool:
+    return status_code in {429, 500, 502, 503, 504}
+
+
+def get_site_retry_sleep_seconds(
+    attempt: int,
+    retry_after: Optional[str] = None,
+) -> float:
+    header_delay = parse_retry_after_seconds(retry_after) or 0.0
+    backoff_delay = min(1.0 * (2**attempt), 8.0)
+    return max(header_delay, backoff_delay)
+
+
+# 사이트 JSON/HTML 요청도 재시도 기준을 맞춰야 외부 네트워크 흔들림이 곧바로 수집 실패가 되지 않는다.
+def fetch_site_bytes(url: str, label: str) -> Optional[bytes]:
+    for attempt in range(SITE_FETCH_MAX_RETRIES + 1):
+        req = urllib.request.Request(url, headers=build_site_headers())
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            if is_retryable_site_status(exc.code) and attempt < SITE_FETCH_MAX_RETRIES:
+                sleep_s = get_site_retry_sleep_seconds(
+                    attempt,
+                    retry_after=exc.headers.get("Retry-After"),
+                )
+                LOGGER.info(
+                    "%s 재시도(%s/%s): %s -> HTTP %s, 대기=%.1fs",
+                    label,
+                    attempt + 1,
+                    SITE_FETCH_MAX_RETRIES,
+                    url,
+                    exc.code,
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
+                continue
+            LOGGER.info("%s 실패: %s (HTTP %s)", label, url, exc.code)
+        except urllib.error.URLError as exc:
+            is_timeout = isinstance(exc.reason, socket.timeout)
+            if attempt < SITE_FETCH_MAX_RETRIES and is_timeout:
+                sleep_s = get_site_retry_sleep_seconds(attempt)
+                LOGGER.info(
+                    "%s 재시도(%s/%s): %s -> timeout, 대기=%.1fs",
+                    label,
+                    attempt + 1,
+                    SITE_FETCH_MAX_RETRIES,
+                    url,
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
+                continue
+            if is_timeout:
+                LOGGER.info("%s 실패: %s (timeout)", label, url)
+            else:
+                LOGGER.info("%s 실패: %s (%s)", label, url, exc.reason)
+        except socket.timeout:
+            if attempt < SITE_FETCH_MAX_RETRIES:
+                sleep_s = get_site_retry_sleep_seconds(attempt)
+                LOGGER.info(
+                    "%s 재시도(%s/%s): %s -> timeout, 대기=%.1fs",
+                    label,
+                    attempt + 1,
+                    SITE_FETCH_MAX_RETRIES,
+                    url,
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
+                continue
+            LOGGER.info("%s 실패: %s (timeout)", label, url)
+    return None
+
+
+def fetch_site_json(url: str) -> Optional[dict]:
+    raw = fetch_site_bytes(url, "API 요청")
+    if raw is None:
+        return None
+    try:
         text = raw.decode("utf-8", errors="replace")
         return json.loads(text)
-    except urllib.error.HTTPError as exc:
-        LOGGER.info("API 요청 실패: %s (HTTP %s)", url, exc.code)
-    except urllib.error.URLError as exc:
-        if isinstance(exc.reason, socket.timeout):
-            LOGGER.info("API 요청 실패: %s (timeout)", url)
-        else:
-            LOGGER.info("API 요청 실패: %s (%s)", url, exc.reason)
-    except socket.timeout:
-        LOGGER.info("API 요청 실패: %s (timeout)", url)
     except json.JSONDecodeError:
         LOGGER.info("API 응답 파싱 실패: %s", url)
-    return None
+        return None
 
 
 def fetch_bbs_list(
@@ -212,6 +296,26 @@ def fetch_bbs_detail(pk_id: str, config_fk: Optional[str] = None) -> Optional[di
     return detail
 
 
+def fetch_detail_metadata_with_html_fallback(
+    pk_id: str,
+    detail_url: str,
+) -> tuple[Optional[str], list[dict], list[dict], str]:
+    # 상세 API가 비었을 때는 항목 단위 HTML 폴백을 시도해 부분 실패가 조용히 성공 처리되지 않게 한다.
+    LOGGER.warning("상세 API 로드 실패: %s -> HTML 폴백 시도", pk_id)
+    written_at, attachments, body_blocks, _signals = fetch_detail_metadata_from_url(detail_url)
+    if written_at or attachments or body_blocks:
+        LOGGER.info(
+            "상세 HTML 폴백 성공: %s (작성일=%s, 첨부=%s, 본문=%s)",
+            pk_id,
+            "Y" if written_at else "N",
+            len(attachments),
+            len(body_blocks),
+        )
+        return written_at, attachments, body_blocks, "html_fallback"
+    LOGGER.warning("상세 HTML 폴백 실패: %s (%s)", pk_id, detail_url)
+    return None, [], [], "detail_missing"
+
+
 def extract_attachments_from_api_data(data: dict) -> list[dict]:
     attachments: list[dict] = []
     seen: set[str] = set()
@@ -240,103 +344,6 @@ def build_list_url(page: int, base_url: Optional[str] = None) -> str:
     query["page"] = str(page)
     base_url = base_url or BASE_URL
     return f"{base_url}?{urlencode(query)}"
-
-
-def extract_detail_url_from_row_html(
-    row_html: str,
-    config_fk: Optional[str] = None,
-) -> Optional[str]:
-    for match in re.finditer(r'href="([^"]+)"', row_html):
-        href = unescape(match.group(1))
-        candidate = normalize_detail_url(href)
-        if candidate and is_detail_url(candidate):
-            return candidate
-        detail_id = extract_detail_id_from_text(href)
-        if detail_id:
-            return normalize_detail_url(build_detail_url(detail_id, config_fk))
-    match = re.search(r"/detail/(\d+)", row_html)
-    if match:
-        return normalize_detail_url(build_detail_url(match.group(1), config_fk))
-    return None
-
-
-def get_browser_launcher(playwright, browser: str):
-    browser = browser.lower()
-    if browser in {"chromium", "chrome", "edge"}:
-        return playwright.chromium
-    if browser == "firefox":
-        return playwright.firefox
-    if browser in {"webkit", "safari"}:
-        return playwright.webkit
-    raise RuntimeError(f"Unsupported BROWSER: {browser}")
-
-
-def extract_list_rows(page, config_fk: Optional[str] = None) -> list[dict]:
-    rows = page.locator(LIST_ROW_SELECTOR)
-    count = rows.count()
-    items = []
-
-    for index in range(count):
-        row = rows.nth(index)
-        cells = row.locator("td")
-        cell_count = cells.count()
-        if cell_count < 5:
-            continue
-
-        num_or_top = cells.nth(0).inner_text().strip()
-        title = cells.nth(1).inner_text().strip()
-        author = cells.nth(2).inner_text().strip()
-        date_text = cells.nth(cell_count - 2).inner_text().strip()
-        views_text = cells.nth(cell_count - 1).inner_text().strip()
-
-        date_iso = parse_datetime(date_text)
-        views = parse_int(views_text)
-        if views is None:
-            continue
-
-        top = num_or_top.strip().upper() == "TOP"
-        detail_url = None
-        link = row.locator("a[href]")
-        link_count = link.count()
-        if link_count:
-            for idx in range(link_count):
-                href = link.nth(idx).get_attribute("href")
-                if not href:
-                    continue
-                candidate = normalize_detail_url(href)
-                if candidate and is_detail_url(candidate):
-                    detail_url = candidate
-                    break
-                detail_id = extract_detail_id_from_text(href)
-                if detail_id:
-                    detail_url = normalize_detail_url(build_detail_url(detail_id, config_fk))
-                    break
-        if not detail_url:
-            onclick = row.get_attribute("onclick") or ""
-            detail_id = extract_detail_id_from_text(onclick)
-            if detail_id:
-                detail_url = normalize_detail_url(build_detail_url(detail_id, config_fk))
-            else:
-                try:
-                    row_html = row.evaluate("row => row.outerHTML")
-                except Exception:
-                    row_html = ""
-                detail_id = extract_detail_id_from_text(row_html or "")
-                if detail_id:
-                    detail_url = normalize_detail_url(build_detail_url(detail_id, config_fk))
-        items.append(
-            {
-                "title": title,
-                "author": author,
-                "date": date_iso,
-                "views": views,
-                "top": top,
-                "row_index": index,
-                "detail_url": detail_url,
-            }
-        )
-
-    return items
 
 
 def return_to_list_page(page, list_url: str) -> None:
@@ -570,13 +577,24 @@ def crawl_top_items_api(
                 build_detail_url(pk_id, config_fk)
             ) or build_detail_url(pk_id, config_fk)
             detail = fetch_bbs_detail(pk_id, config_fk=config_fk)
+            detail_fetch_status = "api"
+            fallback_written_at: Optional[str] = None
+            fallback_attachments: list[dict] = []
+            fallback_body_blocks: list[dict] = []
             if detail is None:
-                LOGGER.info("상세 API 로드 실패: %s", pk_id)
                 detail = {}
+                (
+                    fallback_written_at,
+                    fallback_attachments,
+                    fallback_body_blocks,
+                    detail_fetch_status,
+                ) = fetch_detail_metadata_with_html_fallback(pk_id, detail_url)
 
             title = normalize_title_key(detail.get("title") or entry.get("title") or "")
             author = detail.get("userName") or entry.get("userName") or entry.get("userNickName") or ""
             written_at = parse_compact_datetime(detail.get("regDate") or entry.get("regDate"))
+            if not written_at and fallback_written_at:
+                written_at = fallback_written_at
             views_raw = detail.get("viewCount", entry.get("viewCount"))
             views = parse_int(str(views_raw)) if views_raw is not None else None
             top = str(entry.get("isTop", "")).upper() == "Y"
@@ -584,8 +602,12 @@ def crawl_top_items_api(
                 continue
 
             attachments = extract_attachments_from_api_data(detail or entry)
+            if not attachments and fallback_attachments:
+                attachments = fallback_attachments
             content_html = detail.get("content") or ""
             body_blocks = extract_body_blocks_from_html(content_html) if content_html else []
+            if not body_blocks and fallback_body_blocks:
+                body_blocks = fallback_body_blocks
             if attachments and body_blocks:
                 body_blocks = replace_body_image_urls(body_blocks, attachments)
 
@@ -597,6 +619,9 @@ def crawl_top_items_api(
                 "top": top,
                 "url": detail_url,
             }
+            if detail_fetch_status != "api":
+                # 상위 동기화 로그에서 부분 실패 여부를 바로 구분할 수 있도록 항목 문맥에 상태를 남긴다.
+                item["detail_fetch_status"] = detail_fetch_status
             if body_blocks:
                 item["body_blocks"] = body_blocks
             if classification:
@@ -840,20 +865,10 @@ def crawl_top_items_http(
     return items
 
 def fetch_html(url: str) -> Optional[str]:
-    req = urllib.request.Request(url, headers=build_site_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        LOGGER.info("상세 HTML 요청 실패: %s (HTTP %s)", url, exc.code)
-    except urllib.error.URLError as exc:
-        if isinstance(exc.reason, socket.timeout):
-            LOGGER.info("상세 HTML 요청 실패: %s (timeout)", url)
-        else:
-            LOGGER.info("상세 HTML 요청 실패: %s (%s)", url, exc.reason)
-    except socket.timeout:
-        LOGGER.info("상세 HTML 요청 실패: %s (timeout)", url)
-    return None
+    raw = fetch_site_bytes(url, "상세 HTML 요청")
+    if raw is None:
+        return None
+    return raw.decode("utf-8", errors="replace")
 
 
 def build_detail_signals(html_text: str) -> dict:

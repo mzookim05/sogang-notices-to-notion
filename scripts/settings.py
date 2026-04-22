@@ -9,7 +9,8 @@ DEFAULT_NOTION_API_VERSION = "2022-06-28"
 BASE_URL = "https://www.sogang.ac.kr/ko/scholarship-notice"
 ACADEMIC_BASE_URL = "https://www.sogang.ac.kr/ko/academic-support/notices"
 DEFAULT_QUERY = {"introPkId": "All", "option": "TITLE"}
-USER_AGENT = "Mozilla/5.0 (compatible; ScholarshipCrawler/1.0)"
+# 외부 요청 로그와 저장소 이름이 어긋나지 않도록 프로젝트 전용 사용자 에이전트 이름을 맞춘다.
+USER_AGENT = "Mozilla/5.0 (compatible; SogangNoticesCrawler/1.0)"
 PAGE_ICON_EMOJI = "📢"
 TITLE_PROPERTY = "공지사항"
 AUTHOR_PROPERTY = "작성자"
@@ -269,14 +270,26 @@ def build_detail_url(detail_id: str, config_fk: Optional[str] = None) -> str:
     config_fk = (config_fk or get_bbs_config_fk()).strip()
     return f"{BASE_SITE}/ko/detail/{detail_id}?bbsConfigFk={config_fk}"
 
+
 def get_sync_mode() -> str:
     raw = os.environ.get("SYNC_MODE", "overwrite").strip().lower()
     if raw in {"overwrite", "preserve"}:
         return raw
     return "overwrite"
+
+
 def should_dedupe_on_start() -> bool:
-    raw = os.environ.get("NOTION_DEDUPE_ON_START", "1").strip().lower()
+    # 전체 DB 스캔은 요청량과 실행 시간을 크게 늘릴 수 있어 기본값은 보수적으로 끈다.
+    raw = os.environ.get("NOTION_DEDUPE_ON_START", "0").strip().lower()
     return raw not in {"0", "false", "no", "off"}
+
+
+def should_allow_title_only_match() -> bool:
+    # 제목만 같은 공지가 반복되는 게시판에서는 오탐 업데이트가 날 수 있어 기본값은 끈다.
+    raw = os.environ.get("NOTION_ALLOW_TITLE_ONLY_MATCH", "0").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
 def resolve_html_path() -> Optional[Path]:
     if len(sys.argv) > 1:
         return Path(sys.argv[1])

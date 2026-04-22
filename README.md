@@ -130,14 +130,15 @@ ATTACHMENT_SELFTEST=1 python main.py
 | `BBS_CONFIG_FK` | 선택 | 첫 번째 게시판 ID | 단일 게시판 기준이 필요한 경우의 보조 설정 |
 | `BBS_PAGE_SIZE` | 선택 | `20` | API 요청 시 페이지당 항목 수 |
 | `SYNC_MODE` | 선택 | `overwrite` | 본문 동기화 방식. `overwrite` 또는 `preserve` |
-| `NOTION_DEDUPE_ON_START` | 선택 | `1` | 시작 시 URL 기준 중복 페이지 정리 여부 |
+| `NOTION_DEDUPE_ON_START` | 선택 | `0` | 시작 시 URL 기준 중복 페이지 정리 여부. 요청량 부담이 있어 기본값은 꺼짐 |
+| `NOTION_ALLOW_TITLE_ONLY_MATCH` | 선택 | `0` | URL/작성일이 없을 때 제목만으로 기존 페이지를 찾을지 여부 |
 | `NOTION_UPLOAD_FILES` | 선택 | `1` | 이미지 첨부를 Notion 파일로 업로드할지 여부 |
 | `INCLUDE_NON_TOP` | 선택 | `1` | 비TOP 공지까지 포함할지 여부 |
 | `NON_TOP_MAX_PAGES` | 선택 | `2` | 비TOP 공지 탐색 최대 페이지 수. `0`이면 제한 없음 |
 | `BROWSER` | 선택 | `chromium` | Playwright 브라우저 종류 |
 | `HEADLESS` | 선택 | `1` | 브라우저를 헤드리스 모드로 실행할지 여부 |
 | `USER_AGENT` | 선택 | 기본 사용자 에이전트 | 브라우저/HTTP 요청 시 사용자 에이전트 |
-| `ATTACHMENT_ALLOWED_DOMAINS` | 선택 | `sogang.ac.kr` | 첨부파일 다운로드 허용 도메인 목록 |
+| `ATTACHMENT_ALLOWED_DOMAINS` | 선택 | `sogang.ac.kr` | 첨부파일과 본문 외부 미디어 다운로드 허용 도메인 목록 |
 | `ATTACHMENT_MAX_COUNT` | 선택 | `15` | 공지당 첨부파일 최대 반영 개수 |
 | `ATTACHMENT_SELFTEST` | 선택 | 꺼짐 | 첨부 정책 자체 점검만 수행하고 종료 |
 | `HTML_PATH` | 선택 | 없음 | 수집 대신 로컬 HTML 파일을 입력으로 사용 |
@@ -148,6 +149,11 @@ ATTACHMENT_SELFTEST=1 python main.py
 
 - 매시 정각 스케줄 실행
 - 수동 `workflow_dispatch`
+
+워크플로는 본 실행 전에 아래 최소 검증을 먼저 수행한다.
+
+- `python -m py_compile main.py scripts/*.py`
+- `ATTACHMENT_SELFTEST=1 python main.py`
 
 GitHub Actions에서 실행하려면 저장소 `Secrets`에 아래 값을 등록해야 한다.
 

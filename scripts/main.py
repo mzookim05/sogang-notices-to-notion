@@ -1,5 +1,6 @@
 import os
 
+from common import ensure_item_title
 from crawler import crawl_top_items, run_attachment_policy_selftest
 from log import LOGGER, log_environment_info, setup_logging
 from notion_client import (
@@ -17,7 +18,7 @@ from notion_client import (
     prepare_body_blocks_for_sync,
     update_page,
 )
-from bbs_parser import ensure_item_title, parse_rows
+from bbs_parser import parse_rows
 from settings import (
     AUTHOR_PROPERTY,
     BODY_HASH_IMAGE_MODE_UPLOAD,
@@ -48,11 +49,18 @@ from utils import normalize_date_key, normalize_detail_url
 
 # 실패 로그 한 줄만 봐도 어느 공지에서 멈췄는지 바로 식별할 수 있게 핵심 필드를 묶는다.
 def build_item_context(item: dict) -> str:
+    detail_status = item.get("detail_fetch_status")
+    detail_part = (
+        f", detail={detail_status}"
+        if isinstance(detail_status, str) and detail_status and detail_status != "api"
+        else ""
+    )
     return (
         f"title={item.get('title') or '제목없음'}, "
         f"date={item.get('date') or '날짜없음'}, "
         f"classification={item.get('classification') or '-'}, "
         f"url={item.get('url') or '-'}"
+        f"{detail_part}"
     )
 
 
@@ -171,7 +179,8 @@ def main() -> None:
             date_key = normalize_date_key(item.get("date"))
             if is_top:
                 current_top_dates.setdefault(item["title"], set()).add(date_key)
-            LOGGER.info("처리 시작: %s", label)
+            detail_status = item.get("detail_fetch_status") or "api"
+            LOGGER.info("처리 시작: %s (상세=%s)", label, detail_status)
             try:
                 attachment_count = len(item.get("attachments") or [])
                 if upload_files and has_attachments_property and item.get("attachments"):
@@ -246,11 +255,12 @@ def main() -> None:
                         body_updated += 1
                         body_state = "동기화"
                 LOGGER.info(
-                    "처리 완료: %s (상태=%s, 본문=%s, 첨부=%s)",
+                    "처리 완료: %s (상태=%s, 본문=%s, 첨부=%s, 상세=%s)",
                     label,
                     action,
                     body_state,
                     attachment_count,
+                    detail_status,
                 )
             except Exception as exc:
                 LOGGER.error("항목 처리 실패: %s (%s)", current_item_context, exc)

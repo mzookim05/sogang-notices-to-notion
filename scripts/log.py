@@ -11,7 +11,8 @@ from settings import (
     should_upload_files_to_notion,
 )
 
-LOGGER = logging.getLogger("scholarship-crawler")
+# 저장소와 로그 이름을 맞춰 운영 로그 검색 시 프로젝트 식별이 바로 되게 한다.
+LOGGER = logging.getLogger("sogang-notices-crawler")
 def setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -52,4 +53,3 @@ def log_environment_info() -> None:
         get_notion_api_version(),
         "1" if upload_files else "0",
     )
-

@@ -44,6 +44,14 @@ jobs:
         # 기본 설정이 chromium이므로 CI에서는 필요한 브라우저만 설치한다.
         run: python -m playwright install --with-deps chromium
 
+      - name: Validate Python syntax
+        # 리팩터링 회귀를 빨리 잡기 위해 최소한의 문법 검증을 본 실행 전에 수행한다.
+        run: python -m py_compile main.py scripts/*.py
+
+      - name: Run attachment policy selftest
+        # 외부 다운로드 allowlist가 느슨해지지 않도록 셀프테스트를 먼저 통과시킨다.
+        run: ATTACHMENT_SELFTEST=1 python main.py
+
       - name: Run crawler
         run: python main.py
         env:

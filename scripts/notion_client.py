@@ -35,6 +35,7 @@ from utils import (
     build_site_headers,
     derive_filename_from_url,
     extract_attachment_name,
+    is_allowed_external_download_url,
     is_embed_file_candidate,
     is_image_name_or_url,
     is_pdf_name_or_url,
@@ -50,6 +51,8 @@ NOTION_MAX_RETRIES = 5
 NOTION_RATE_LIMIT_BASE_DELAY_SECONDS = 3.0
 NOTION_TRANSIENT_BASE_DELAY_SECONDS = 1.0
 NEXT_NOTION_REQUEST_AT = 0.0
+EXTERNAL_FETCH_MAX_RETRIES = 3
+EXTERNAL_UPLOAD_MAX_RETRIES = 3
 
 
 class NotionRequestError(RuntimeError):
@@ -182,22 +185,90 @@ def is_notion_api_url(url: str) -> bool:
     parsed = urlsplit(url)
     return parsed.scheme == "https" and parsed.hostname == "api.notion.com"
 
-def download_file_bytes(url: str) -> tuple[Optional[bytes], Optional[str]]:
-    req = urllib.request.Request(url, headers=build_site_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip()
-            data = resp.read()
-            return data, content_type or None
-    except urllib.error.HTTPError as exc:
-        LOGGER.info("파일 다운로드 실패: %s (HTTP %s)", url, exc.code)
-    except urllib.error.URLError as exc:
-        if isinstance(exc.reason, socket.timeout):
+
+def summarize_external_request_target(url: str) -> str:
+    parsed = urlsplit(url)
+    host = parsed.netloc or "-"
+    path = parsed.path or "/"
+    return f"{host}{path}"
+
+
+def is_retryable_http_status(status_code: int) -> bool:
+    return status_code in {429, 500, 502, 503, 504}
+
+
+def get_external_retry_sleep_seconds(
+    attempt: int,
+    retry_after: Optional[str] = None,
+) -> float:
+    header_delay = parse_retry_after_seconds(retry_after) or 0.0
+    backoff_delay = min(1.0 * (2**attempt), 8.0)
+    return max(header_delay, backoff_delay)
+
+
+def download_file_bytes(
+    url: str,
+    require_file_hint: bool = False,
+) -> tuple[Optional[bytes], Optional[str]]:
+    # 실제 다운로드 직전에도 allowlist를 다시 확인해, 첨부와 본문 미디어가 같은 정책을 따르도록 한다.
+    if not is_allowed_external_download_url(url, require_file_hint=require_file_hint):
+        LOGGER.warning("외부 파일 다운로드 차단: %s", url)
+        return None, None
+    request_target = summarize_external_request_target(url)
+    for attempt in range(EXTERNAL_FETCH_MAX_RETRIES + 1):
+        req = urllib.request.Request(url, headers=build_site_headers())
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip()
+                data = resp.read()
+                return data, content_type or None
+        except urllib.error.HTTPError as exc:
+            if is_retryable_http_status(exc.code) and attempt < EXTERNAL_FETCH_MAX_RETRIES:
+                sleep_s = get_external_retry_sleep_seconds(
+                    attempt,
+                    retry_after=exc.headers.get("Retry-After"),
+                )
+                LOGGER.info(
+                    "외부 파일 다운로드 재시도(%s/%s): %s -> HTTP %s, 대기=%.1fs",
+                    attempt + 1,
+                    EXTERNAL_FETCH_MAX_RETRIES,
+                    request_target,
+                    exc.code,
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
+                continue
+            LOGGER.info("파일 다운로드 실패: %s (HTTP %s)", url, exc.code)
+        except urllib.error.URLError as exc:
+            is_timeout = isinstance(exc.reason, socket.timeout)
+            if attempt < EXTERNAL_FETCH_MAX_RETRIES and is_timeout:
+                sleep_s = get_external_retry_sleep_seconds(attempt)
+                LOGGER.info(
+                    "외부 파일 다운로드 재시도(%s/%s): %s -> timeout, 대기=%.1fs",
+                    attempt + 1,
+                    EXTERNAL_FETCH_MAX_RETRIES,
+                    request_target,
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
+                continue
+            if is_timeout:
+                LOGGER.info("파일 다운로드 실패: %s (timeout)", url)
+            else:
+                LOGGER.info("파일 다운로드 실패: %s (%s)", url, exc.reason)
+        except socket.timeout:
+            if attempt < EXTERNAL_FETCH_MAX_RETRIES:
+                sleep_s = get_external_retry_sleep_seconds(attempt)
+                LOGGER.info(
+                    "외부 파일 다운로드 재시도(%s/%s): %s -> timeout, 대기=%.1fs",
+                    attempt + 1,
+                    EXTERNAL_FETCH_MAX_RETRIES,
+                    request_target,
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
+                continue
             LOGGER.info("파일 다운로드 실패: %s (timeout)", url)
-        else:
-            LOGGER.info("파일 다운로드 실패: %s (%s)", url, exc.reason)
-    except socket.timeout:
-        LOGGER.info("파일 다운로드 실패: %s (timeout)", url)
     return None, None
 
 
@@ -480,25 +551,65 @@ def send_file_upload(
     body, content_header = encode_multipart_form_data(
         filename, content_type, payload, part_number=part_number
     )
-    req = urllib.request.Request(upload_url, data=body, method="POST")
-    req.add_header("Content-Type", content_header)
-    req.add_header("Content-Length", str(len(body)))
-    if is_notion_api_url(upload_url):
-        req.add_header("Authorization", f"Bearer {token}")
-        req.add_header("Notion-Version", get_notion_api_version())
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.load(resp)
-    except urllib.error.HTTPError as exc:
-        body_text = exc.read().decode("utf-8", errors="replace")
-        LOGGER.info("파일 업로드 전송 실패: HTTP %s (%s)", exc.code, body_text)
-    except urllib.error.URLError as exc:
-        if isinstance(exc.reason, socket.timeout):
+    request_target = summarize_external_request_target(upload_url)
+    for attempt in range(EXTERNAL_UPLOAD_MAX_RETRIES + 1):
+        req = urllib.request.Request(upload_url, data=body, method="POST")
+        req.add_header("Content-Type", content_header)
+        req.add_header("Content-Length", str(len(body)))
+        if is_notion_api_url(upload_url):
+            req.add_header("Authorization", f"Bearer {token}")
+            req.add_header("Notion-Version", get_notion_api_version())
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as exc:
+            body_text = exc.read().decode("utf-8", errors="replace")
+            if is_retryable_http_status(exc.code) and attempt < EXTERNAL_UPLOAD_MAX_RETRIES:
+                sleep_s = get_external_retry_sleep_seconds(
+                    attempt,
+                    retry_after=exc.headers.get("Retry-After"),
+                )
+                LOGGER.info(
+                    "파일 업로드 전송 재시도(%s/%s): %s -> HTTP %s, 대기=%.1fs",
+                    attempt + 1,
+                    EXTERNAL_UPLOAD_MAX_RETRIES,
+                    request_target,
+                    exc.code,
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
+                continue
+            LOGGER.info("파일 업로드 전송 실패: HTTP %s (%s)", exc.code, body_text)
+        except urllib.error.URLError as exc:
+            is_timeout = isinstance(exc.reason, socket.timeout)
+            if attempt < EXTERNAL_UPLOAD_MAX_RETRIES and is_timeout:
+                sleep_s = get_external_retry_sleep_seconds(attempt)
+                LOGGER.info(
+                    "파일 업로드 전송 재시도(%s/%s): %s -> timeout, 대기=%.1fs",
+                    attempt + 1,
+                    EXTERNAL_UPLOAD_MAX_RETRIES,
+                    request_target,
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
+                continue
+            if is_timeout:
+                LOGGER.info("파일 업로드 전송 실패: timeout")
+            else:
+                LOGGER.info("파일 업로드 전송 실패: %s", exc.reason)
+        except socket.timeout:
+            if attempt < EXTERNAL_UPLOAD_MAX_RETRIES:
+                sleep_s = get_external_retry_sleep_seconds(attempt)
+                LOGGER.info(
+                    "파일 업로드 전송 재시도(%s/%s): %s -> timeout, 대기=%.1fs",
+                    attempt + 1,
+                    EXTERNAL_UPLOAD_MAX_RETRIES,
+                    request_target,
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
+                continue
             LOGGER.info("파일 업로드 전송 실패: timeout")
-        else:
-            LOGGER.info("파일 업로드 전송 실패: %s", exc.reason)
-    except socket.timeout:
-        LOGGER.info("파일 업로드 전송 실패: timeout")
     return None
 
 
@@ -514,7 +625,7 @@ def upload_external_file_to_notion(
     if cached:
         return cached
 
-    payload, content_type = download_file_bytes(url)
+    payload, content_type = download_file_bytes(url, require_file_hint=not expect_image)
     if not payload:
         return None
     filename = sanitize_filename(
@@ -614,6 +725,11 @@ def prepare_body_blocks_for_sync(token: str, blocks: list[dict]) -> list[dict]:
             if not url:
                 updated.append(block)
                 continue
+            # 본문 이미지도 첨부와 같은 allowlist를 적용해 스케줄 러너가 임의 외부 호스트를 읽지 않게 한다.
+            if not is_allowed_external_download_url(url):
+                LOGGER.info("본문 이미지 업로드 스킵: 허용되지 않은 외부 URL (%s)", url)
+                updated.append(block)
+                continue
             filename = derive_filename_from_url(url, fallback="image")
             upload_id = upload_external_file_to_notion(
                 token, url, filename, expect_image=True
@@ -634,6 +750,11 @@ def prepare_body_blocks_for_sync(token: str, blocks: list[dict]) -> list[dict]:
             embed = block.get("embed", {})
             url = embed.get("url") or ""
             if not url or not is_embed_file_candidate(url):
+                updated.append(block)
+                continue
+            # 임베드도 도메인과 파일 신호가 둘 다 맞을 때만 내려받아 업로드한다.
+            if not is_allowed_external_download_url(url, require_file_hint=True):
+                LOGGER.info("본문 임베드 업로드 스킵: 허용되지 않은 외부 URL (%s)", url)
                 updated.append(block)
                 continue
             filename = derive_filename_from_url(url, fallback="file")

@@ -1,6 +1,12 @@
 import re
 from typing import Optional
 
+from common import (
+    ensure_item_title,
+    is_empty_paragraph_block,
+    normalize_body_blocks,
+    rich_text_plain_text,
+)
 from log import LOGGER
 from notion_client import (
     NotionRequestError,
@@ -12,7 +18,6 @@ from notion_client import (
     query_database,
     update_page,
 )
-from bbs_parser import extract_detail_id_from_text
 from settings import (
     ATTACHMENT_PROPERTY,
     AUTHOR_PROPERTY,
@@ -25,6 +30,7 @@ from settings import (
     TYPE_PROPERTY,
     URL_PROPERTY,
     VIEWS_PROPERTY,
+    should_allow_title_only_match,
 )
 from utils import (
     DEFAULT_ANNOTATIONS,
@@ -33,7 +39,6 @@ from utils import (
     chunks,
     normalize_date_key,
     normalize_detail_url,
-    normalize_title_key,
 )
 
 def extract_type_from_title(title: str) -> str:
@@ -53,60 +58,6 @@ def extract_type_from_title(title: str) -> str:
         if label:
             return label
     return FALLBACK_TYPE
-def is_empty_paragraph_block(block: dict) -> bool:
-    if block.get("type") != "paragraph":
-        return False
-    rich_text = block.get("paragraph", {}).get("rich_text", [])
-    if not rich_text:
-        return True
-    content = "".join(
-        item.get("text", {}).get("content", "") for item in rich_text
-    )
-    return content.replace("\u00a0", "").strip() == ""
-
-
-def strip_trailing_empty_paragraphs(blocks: list[dict]) -> list[dict]:
-    if not blocks:
-        return blocks
-    end = len(blocks)
-    while end > 0 and is_empty_paragraph_block(blocks[end - 1]):
-        end -= 1
-    if end == len(blocks):
-        return blocks
-    return blocks[:end]
-
-
-def trim_trailing_whitespace_rich_text(rich_text: list[dict]) -> None:
-    idx = len(rich_text) - 1
-    while idx >= 0:
-        item = rich_text[idx]
-        if item.get("type") != "text":
-            break
-        text_payload = item.get("text", {})
-        content = text_payload.get("content", "")
-        trimmed = content.rstrip()
-        if trimmed == content:
-            break
-        if trimmed:
-            text_payload["content"] = trimmed
-            break
-        rich_text.pop()
-        idx -= 1
-
-
-def normalize_body_blocks(blocks: list[dict]) -> list[dict]:
-    normalized = strip_trailing_empty_paragraphs(blocks or [])
-    if not normalized:
-        return normalized
-    last = normalized[-1]
-    block_type = last.get("type")
-    if block_type in {"paragraph", "bulleted_list_item"}:
-        rich_text = last.get(block_type, {}).get("rich_text", [])
-        if rich_text:
-            trim_trailing_whitespace_rich_text(rich_text)
-            if not rich_text:
-                normalized = strip_trailing_empty_paragraphs(normalized[:-1])
-    return normalized
 
 
 def is_image_only_blocks(blocks: list[dict]) -> bool:
@@ -120,61 +71,6 @@ def is_image_only_blocks(blocks: list[dict]) -> bool:
             return False
         has_image = True
     return has_image
-
-
-def rich_text_plain_text(rich_text: list[dict]) -> str:
-    return "".join(item.get("text", {}).get("content", "") for item in rich_text)
-
-
-def extract_first_nonempty_line(text: str) -> str:
-    if not text:
-        return ""
-    for line in text.splitlines():
-        cleaned = line.replace("\u00a0", " ").strip()
-        if cleaned:
-            return cleaned
-    return text.replace("\u00a0", " ").strip()
-
-
-def derive_title_from_blocks(blocks: list[dict]) -> str:
-    for block in blocks or []:
-        block_type = block.get("type")
-        if block_type not in {"paragraph", "bulleted_list_item"}:
-            continue
-        rich_text = block.get(block_type, {}).get("rich_text", [])
-        if not rich_text:
-            continue
-        text = rich_text_plain_text(rich_text)
-        candidate = extract_first_nonempty_line(text)
-        if candidate:
-            return candidate
-    return ""
-
-
-def build_fallback_title(detail_url: Optional[str], date_iso: Optional[str]) -> str:
-    detail_id = extract_detail_id_from_text(detail_url or "")
-    if detail_id:
-        return f"제목없음-{detail_id}"
-    date_key = normalize_date_key(date_iso)
-    if date_key:
-        return f"제목없음-{date_key}"
-    return "제목없음"
-
-
-def ensure_item_title(
-    item: dict,
-    body_blocks: list[dict],
-    detail_url: Optional[str] = None,
-) -> None:
-    title = normalize_title_key(item.get("title", ""))
-    if title:
-        item["title"] = title
-        return
-    derived = derive_title_from_blocks(body_blocks)
-    if derived:
-        item["title"] = normalize_title_key(derived)
-        return
-    item["title"] = build_fallback_title(detail_url or item.get("url"), item.get("date"))
 
 
 def has_sync_marker(rich_text: list[dict]) -> bool:
@@ -520,7 +416,8 @@ def find_existing_page(
                 archive_duplicates=True,
             )
 
-    if title:
+    # 제목 단독 매칭은 오탐 업데이트 위험이 커서 설정으로 명시적으로 켠 경우에만 허용한다.
+    if title and should_allow_title_only_match():
         results = query_existing_pages_with_stage_log(
             token,
             database_id,

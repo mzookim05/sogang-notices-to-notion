@@ -252,6 +252,27 @@ def is_attachment_candidate(
         return True, False
     return False, False
 
+
+# 실제 다운로드 직전에도 동일한 allowlist를 강제해, 본문 미디어와 첨부파일 정책이 어긋나지 않게 한다.
+def is_allowed_external_download_url(
+    url: str,
+    require_file_hint: bool = False,
+) -> bool:
+    if not url:
+        return False
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = (parsed.netloc or "").lower()
+    allowed_domains = get_attachment_allowed_domains()
+    if not is_allowed_attachment_host(host, allowed_domains):
+        return False
+    if not require_file_hint:
+        return True
+    allowed, _ = is_attachment_candidate(url, url, allow_domain_only=True)
+    return allowed
+
+
 def normalize_attachment_name(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "")).strip().lower()
 
