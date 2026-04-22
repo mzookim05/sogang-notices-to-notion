@@ -85,7 +85,9 @@ def parse_css_color(value: str) -> Optional[tuple[int, int, int]]:
                         rgb.append(int(float(part)))
                     except ValueError:
                         return None
-            return tuple(max(0, min(255, val)) for val in rgb)
+            # Pylance가 길이 미정 tuple로 보지 않도록, 3채널 RGB를 고정 길이로 반환한다.
+            normalized_rgb = [max(0, min(255, val)) for val in rgb[:3]]
+            return normalized_rgb[0], normalized_rgb[1], normalized_rgb[2]
     return None
 
 

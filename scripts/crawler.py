@@ -455,22 +455,28 @@ def fetch_detail_for_row(
     row.scroll_into_view_if_needed()
     detail_id = extract_detail_id_from_row(row)
     if detail_id:
-        detail_url = normalize_detail_url(build_detail_url(detail_id, config_fk))
-        written_at, attachments, body_blocks, signals = fetch_detail_metadata_from_url(
-            detail_url
-        )
-        if should_retry_detail_fetch(written_at, attachments, body_blocks, signals):
-            pw_written_at, pw_attachments, pw_body_blocks = fetch_detail_metadata_via_playwright(
-                page, list_url, detail_url
+        # 상세 ID에서 만든 URL도 정규화 결과가 없을 수 있으니, str로 확정된 뒤에만 메타데이터 조회를 진행한다.
+        normalized_detail_url = normalize_detail_url(build_detail_url(detail_id, config_fk))
+        if normalized_detail_url:
+            written_at, attachments, body_blocks, signals = fetch_detail_metadata_from_url(
+                normalized_detail_url
             )
-            if not written_at and pw_written_at:
-                written_at = pw_written_at
-            if pw_attachments:
-                attachments = pw_attachments
-            if pw_body_blocks:
-                body_blocks = pw_body_blocks
-        if written_at or attachments or body_blocks:
-            return written_at, detail_url, attachments, body_blocks
+            if should_retry_detail_fetch(written_at, attachments, body_blocks, signals):
+                pw_written_at, pw_attachments, pw_body_blocks = (
+                    fetch_detail_metadata_via_playwright(
+                        page,
+                        list_url,
+                        normalized_detail_url,
+                    )
+                )
+                if not written_at and pw_written_at:
+                    written_at = pw_written_at
+                if pw_attachments:
+                    attachments = pw_attachments
+                if pw_body_blocks:
+                    body_blocks = pw_body_blocks
+            if written_at or attachments or body_blocks:
+                return written_at, normalized_detail_url, attachments, body_blocks
     row.click()
 
     detail_url = wait_for_detail_url(page, list_url)

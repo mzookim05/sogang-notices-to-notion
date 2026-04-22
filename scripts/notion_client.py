@@ -176,6 +176,12 @@ def get_retry_sleep_seconds(
         return max(header_delay, backoff_delay)
     return min(NOTION_TRANSIENT_BASE_DELAY_SECONDS * (2**attempt), 8.0)
 
+
+# 업로드 URL에 토큰 헤더를 붙일 때는 부분 문자열이 아니라 스킴과 호스트를 함께 검사해야 한다.
+def is_notion_api_url(url: str) -> bool:
+    parsed = urlsplit(url)
+    return parsed.scheme == "https" and parsed.hostname == "api.notion.com"
+
 def download_file_bytes(url: str) -> tuple[Optional[bytes], Optional[str]]:
     req = urllib.request.Request(url, headers=build_site_headers())
     try:
@@ -228,9 +234,10 @@ def compress_image_to_limit(
     width, height = working.size
     for scale in scale_steps:
         if scale < 1.0:
+            # Pylance와 최신 Pillow 타입 정의 기준에 맞춰 enum 형태의 리샘플링 상수를 사용한다.
             resized = working.resize(
                 (max(1, int(width * scale)), max(1, int(height * scale))),
-                Image.LANCZOS,
+                Image.Resampling.LANCZOS,
             )
         else:
             resized = working
@@ -444,6 +451,8 @@ def notion_request(
                 method=method,
                 target=request_target,
             ) from exc
+    # 위 루프는 성공 시 return, 실패 시 예외를 발생시키는 구조지만 정적 분석기에도 종료 조건을 명시한다.
+    raise RuntimeError(f"Notion API 요청 종료 상태 불명: {method} {request_target}")
 
 
 def create_file_upload(
@@ -474,7 +483,7 @@ def send_file_upload(
     req = urllib.request.Request(upload_url, data=body, method="POST")
     req.add_header("Content-Type", content_header)
     req.add_header("Content-Length", str(len(body)))
-    if "api.notion.com" in upload_url:
+    if is_notion_api_url(upload_url):
         req.add_header("Authorization", f"Bearer {token}")
         req.add_header("Notion-Version", get_notion_api_version())
     try:
@@ -939,7 +948,11 @@ def create_page(token: str, database_id: str, properties: dict) -> str:
         "icon": build_icon(),
     }
     data = notion_request("POST", "https://api.notion.com/v1/pages", token, payload)
-    return data.get("id")
+    # Notion 응답에 page id가 없으면 후속 update 요청이 전부 깨지므로 즉시 실패시킨다.
+    page_id = data.get("id")
+    if not isinstance(page_id, str) or not page_id:
+        raise RuntimeError("Notion 페이지 생성 응답에 id가 없습니다.")
+    return page_id
 
 
 def update_page(token: str, page_id: str, properties: dict) -> None:
