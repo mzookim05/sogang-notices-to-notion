@@ -5,6 +5,8 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from common import (
+    ATTACHMENTS_STATUS_KNOWN,
+    ATTACHMENTS_STATUS_UNKNOWN,
     ensure_item_title,
     is_empty_paragraph_block,
     normalize_body_blocks,
@@ -251,9 +253,19 @@ def extract_attachment_state(properties: dict) -> list[dict]:
 
 
 def normalize_item_attachments(item: dict) -> None:
-    # 수집기마다 첨부가 없을 때 attachments 키를 생략할 수 있으므로,
-    # 동기화 직전에는 항상 list로 정규화해 files=[] clear payload가 실제 런타임에서도 빠지지 않게 한다.
-    item["attachments"] = list(item.get("attachments") or [])
+    status = str(item.get("attachments_status") or "").strip()
+    if status == ATTACHMENTS_STATUS_UNKNOWN:
+        # 첨부 확인 실패는 "첨부 없음"으로 확정할 수 없으므로 files=[]를 보내지 않는다.
+        item.pop("attachments", None)
+        return
+    if "attachments" in item:
+        item["attachments"] = list(item.get("attachments") or [])
+        item["attachments_status"] = ATTACHMENTS_STATUS_KNOWN
+        return
+    if status == ATTACHMENTS_STATUS_KNOWN:
+        # 수집 단계가 명확히 "첨부 없음"을 확인한 경우에만 빈 리스트를 만들어
+        # 기존 Notion 첨부파일 속성을 안전하게 비울 수 있게 한다.
+        item["attachments"] = []
 
 
 def normalize_notion_hosted_file_key(url: str) -> str:

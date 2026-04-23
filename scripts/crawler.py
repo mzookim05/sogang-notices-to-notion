@@ -11,6 +11,8 @@ from typing import Optional
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from common import (
+    ATTACHMENTS_STATUS_KNOWN,
+    ATTACHMENTS_STATUS_UNKNOWN,
     ensure_item_title,
     extract_detail_id_from_text,
     extract_detail_url_from_row_html,
@@ -778,10 +780,11 @@ def run_attachment_policy_selftest() -> None:
                 raise RuntimeError("첨부 업로드 셀프테스트 실패(stale 상태 차단)")
 
             # 실제 런타임에서는 첨부가 없을 때 attachments 키가 생략될 수 있으므로,
-            # 동기화 직전 정규화만 거쳐도 files=[] clear payload가 생성되는지 확인한다.
+            # "첨부 없음"이 확정된 항목만 files=[] clear payload가 생성되는지 확인한다.
             attachment_removed_item = {
                 "title": "첨부 제거 테스트",
                 "top": False,
+                "attachments_status": ATTACHMENTS_STATUS_KNOWN,
             }
             sync_module.normalize_item_attachments(attachment_removed_item)
             if (
@@ -795,6 +798,44 @@ def run_attachment_policy_selftest() -> None:
                 != {"files": []}
             ):
                 raise RuntimeError("첨부 업로드 셀프테스트 실패(빈 첨부 clear)")
+
+            # 반대로 첨부 확인 실패 상태는 빈 첨부로 오해하면 안 되므로,
+            # properties payload에서 첨부파일 속성 자체가 빠져 기존 값을 보존해야 한다.
+            attachment_unknown_item = {
+                "title": "첨부 미확인 테스트",
+                "top": False,
+                "attachments_status": ATTACHMENTS_STATUS_UNKNOWN,
+            }
+            sync_module.normalize_item_attachments(attachment_unknown_item)
+            if (
+                "attachments" in attachment_unknown_item
+                or sync_module.build_properties(
+                    attachment_unknown_item,
+                    has_views_property=False,
+                    has_attachments_property=True,
+                    has_classification_property=False,
+                ).get("첨부파일")
+                is not None
+            ):
+                raise RuntimeError("첨부 업로드 셀프테스트 실패(미확인 첨부 보존)")
+
+            # 라벨만 있는 빈 첨부 영역은 실제 "첨부 없음"으로 보고, 파일 링크 흔적이 있는데 비면 미확인으로 본다.
+            if classify_attachment_status_from_signals(
+                [],
+                {
+                    "has_html": True,
+                    "has_attachment_label": True,
+                    "has_attachment_link": False,
+                },
+            ) != ATTACHMENTS_STATUS_KNOWN or classify_attachment_status_from_signals(
+                [],
+                {
+                    "has_html": True,
+                    "has_attachment_label": True,
+                    "has_attachment_link": True,
+                },
+            ) != ATTACHMENTS_STATUS_UNKNOWN:
+                raise RuntimeError("첨부 업로드 셀프테스트 실패(첨부 상태 분류)")
 
             # 재사용 후보 조회는 최적화일 뿐이므로, 루트 컨테이너 조회 실패가 항목 전체 실패로 번지지 않고
             # 새 업로드 경로로 자연스럽게 되돌아가는지 확인한다.
@@ -881,6 +922,75 @@ def cap_attachments(attachments: list[dict], label: str) -> list[dict]:
         )
         return attachments[:max_count]
     return attachments
+
+
+def classify_attachment_status_from_signals(
+    attachments: list[dict],
+    signals: dict,
+) -> str:
+    if attachments:
+        return ATTACHMENTS_STATUS_KNOWN
+    if not signals.get("has_html"):
+        return ATTACHMENTS_STATUS_UNKNOWN
+    if signals.get("has_attachment_link"):
+        # 실제 파일 링크 흔적은 보였는데 추출 결과가 비면 "없음"이 아니라 "확인 실패"로 남겨
+        # 기존 Notion 첨부파일 속성을 실수로 비우지 않는다. 라벨만 있는 빈 첨부 영역은 clear를 허용한다.
+        return ATTACHMENTS_STATUS_UNKNOWN
+    return ATTACHMENTS_STATUS_KNOWN
+
+
+def classify_attachment_status_from_api_detail(
+    detail: Optional[dict],
+    attachments: list[dict],
+    fallback_reason: Optional[str],
+    fallback_attachment_status: str,
+) -> str:
+    if attachments:
+        return ATTACHMENTS_STATUS_KNOWN
+    if not isinstance(detail, dict) or not detail:
+        return fallback_attachment_status
+
+    content_html = str(detail.get("content") or "")
+    has_attachment_hint = bool(
+        content_html and ATTACHMENT_LINK_PATTERN.search(content_html)
+    )
+    has_file_value = any(
+        str(detail.get(f"fileValue{idx}") or "").strip() for idx in range(1, 6)
+    )
+    if has_attachment_hint or has_file_value:
+        # API가 첨부 흔적을 줬는데 최종 첨부가 비면 일시 실패나 정책 차단일 수 있으므로,
+        # HTML 폴백이 명확히 빈 첨부를 확인한 경우에만 clear를 허용한다.
+        return (
+            ATTACHMENTS_STATUS_KNOWN
+            if fallback_attachment_status == ATTACHMENTS_STATUS_KNOWN
+            else ATTACHMENTS_STATUS_UNKNOWN
+        )
+    if fallback_reason and "attachment_missing" in fallback_reason.split(","):
+        return fallback_attachment_status
+    return ATTACHMENTS_STATUS_KNOWN
+
+
+def apply_item_attachments(
+    item: dict,
+    attachments: list[dict],
+    attachment_status: str,
+) -> None:
+    status = (
+        ATTACHMENTS_STATUS_KNOWN
+        if attachments or attachment_status == ATTACHMENTS_STATUS_KNOWN
+        else ATTACHMENTS_STATUS_UNKNOWN
+    )
+    item["attachments_status"] = status
+    if status != ATTACHMENTS_STATUS_KNOWN:
+        # 이번 실행에서 첨부 확인이 실패한 항목은 attachments 키 자체를 제거해
+        # build_properties가 Notion files=[] clear payload를 만들지 못하게 한다.
+        item.pop("attachments", None)
+        return
+
+    capped = cap_attachments(attachments, item["title"]) if attachments else []
+    item["attachments"] = capped
+    if capped:
+        log_attachments(item["title"], capped)
 
 
 def parse_retry_after_seconds(raw_value: Optional[str]) -> Optional[float]:
@@ -1048,10 +1158,11 @@ def fetch_detail_metadata_with_html_fallback(
     pk_id: str,
     detail_url: str,
     reason: str,
-) -> tuple[Optional[str], list[dict], list[dict], str]:
+) -> tuple[Optional[str], list[dict], list[dict], str, str]:
     # 단순 API 미응답과 부분 성공을 로그에서 구분할 수 있게 폴백 사유를 함께 남긴다.
     LOGGER.warning("상세 API 보완 조회: %s (%s) -> HTML 폴백 시도", pk_id, reason)
-    written_at, attachments, body_blocks, _signals = fetch_detail_metadata_from_url(detail_url)
+    written_at, attachments, body_blocks, signals = fetch_detail_metadata_from_url(detail_url)
+    attachment_status = classify_attachment_status_from_signals(attachments, signals)
     if written_at or attachments or body_blocks:
         LOGGER.info(
             "상세 HTML 폴백 성공: %s (작성일=%s, 첨부=%s, 본문=%s)",
@@ -1061,10 +1172,10 @@ def fetch_detail_metadata_with_html_fallback(
             len(body_blocks),
         )
         status = "html_fallback" if reason == "api_missing" else "html_fallback_partial"
-        return written_at, attachments, body_blocks, status
+        return written_at, attachments, body_blocks, status, attachment_status
     LOGGER.warning("상세 HTML 폴백 실패: %s (%s)", pk_id, detail_url)
     status = "detail_missing" if reason == "api_missing" else "detail_incomplete"
-    return None, [], [], status
+    return None, [], [], status, ATTACHMENTS_STATUS_UNKNOWN
 
 
 def extract_attachments_from_api_data(data: dict) -> list[dict]:
@@ -1135,12 +1246,13 @@ def fetch_detail_metadata_via_playwright(
     page,
     list_url: str,
     detail_url: str,
-) -> tuple[Optional[str], list[dict], list[dict]]:
+) -> tuple[Optional[str], list[dict], list[dict], str]:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
     written_at = None
     attachments: list[dict] = []
     body_blocks: list[dict] = []
+    attachment_status = ATTACHMENTS_STATUS_UNKNOWN
     try:
         page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
         if not wait_for_written_at(page):
@@ -1159,20 +1271,27 @@ def fetch_detail_metadata_via_playwright(
             except PlaywrightTimeoutError:
                 label_visible = 0
         LOGGER.info("첨부파일 라벨 감지: %s (%s)", label_visible, detail_url)
+        html_text = page.content()
         written_at = extract_written_at_from_page(page)
         if not written_at:
-            written_at = extract_written_at_from_detail(page.content())
+            written_at = extract_written_at_from_detail(html_text)
         attachments = extract_attachments_from_page(page)
         if not attachments:
-            attachments = extract_attachments_from_detail(page.content())
-        body_blocks = extract_body_blocks_from_html(page.content())
+            attachments = extract_attachments_from_detail(html_text)
+        body_blocks = extract_body_blocks_from_html(html_text)
+        # Playwright까지 도달한 페이지는 HTML 신호를 다시 분류해
+        # 빈 첨부가 확정인지 추출 실패인지 상위 동기화 단계가 구분하게 한다.
+        attachment_status = classify_attachment_status_from_signals(
+            attachments,
+            build_detail_signals(html_text),
+        )
         if attachments and body_blocks:
             body_blocks = replace_body_image_urls(body_blocks, attachments)
     except PlaywrightTimeoutError:
         LOGGER.info("상세 페이지 로드 실패: %s", detail_url)
     finally:
         return_to_list_page(page, list_url)
-    return written_at, attachments, body_blocks
+    return written_at, attachments, body_blocks, attachment_status
 
 
 def fetch_detail_for_row(
@@ -1181,7 +1300,7 @@ def fetch_detail_for_row(
     row_index: int,
     detail_url: Optional[str],
     config_fk: Optional[str] = None,
-) -> tuple[Optional[str], Optional[str], list[dict], list[dict]]:
+) -> tuple[Optional[str], Optional[str], list[dict], list[dict], str]:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
     if detail_url:
@@ -1193,21 +1312,24 @@ def fetch_detail_for_row(
         written_at, attachments, body_blocks, signals = fetch_detail_metadata_from_url(
             detail_url
         )
+        attachment_status = classify_attachment_status_from_signals(attachments, signals)
         if should_retry_detail_fetch(written_at, attachments, body_blocks, signals):
-            pw_written_at, pw_attachments, pw_body_blocks = fetch_detail_metadata_via_playwright(
-                page, list_url, detail_url
+            pw_written_at, pw_attachments, pw_body_blocks, pw_attachment_status = (
+                fetch_detail_metadata_via_playwright(page, list_url, detail_url)
             )
             if not written_at and pw_written_at:
                 written_at = pw_written_at
             if pw_attachments:
                 attachments = pw_attachments
+            if pw_attachment_status == ATTACHMENTS_STATUS_KNOWN or pw_attachments:
+                attachment_status = pw_attachment_status
             if pw_body_blocks:
                 body_blocks = pw_body_blocks
-        return written_at, detail_url, attachments, body_blocks
+        return written_at, detail_url, attachments, body_blocks, attachment_status
 
     rows = page.locator(LIST_ROW_SELECTOR)
     if row_index >= rows.count():
-        return None, None, [], []
+        return None, None, [], [], ATTACHMENTS_STATUS_UNKNOWN
 
     row = rows.nth(row_index)
     row.scroll_into_view_if_needed()
@@ -1219,8 +1341,12 @@ def fetch_detail_for_row(
             written_at, attachments, body_blocks, signals = fetch_detail_metadata_from_url(
                 normalized_detail_url
             )
+            attachment_status = classify_attachment_status_from_signals(
+                attachments,
+                signals,
+            )
             if should_retry_detail_fetch(written_at, attachments, body_blocks, signals):
-                pw_written_at, pw_attachments, pw_body_blocks = (
+                pw_written_at, pw_attachments, pw_body_blocks, pw_attachment_status = (
                     fetch_detail_metadata_via_playwright(
                         page,
                         list_url,
@@ -1231,40 +1357,54 @@ def fetch_detail_for_row(
                     written_at = pw_written_at
                 if pw_attachments:
                     attachments = pw_attachments
+                if pw_attachment_status == ATTACHMENTS_STATUS_KNOWN or pw_attachments:
+                    attachment_status = pw_attachment_status
                 if pw_body_blocks:
                     body_blocks = pw_body_blocks
             if written_at or attachments or body_blocks:
-                return written_at, normalized_detail_url, attachments, body_blocks
+                return (
+                    written_at,
+                    normalized_detail_url,
+                    attachments,
+                    body_blocks,
+                    attachment_status,
+                )
     row.click()
 
     detail_url = wait_for_detail_url(page, list_url)
     if not detail_url:
         LOGGER.info("상세 URL 전환 실패: row %s", row_index)
         return_to_list_page(page, list_url)
-        return None, None, [], []
+        return None, None, [], [], ATTACHMENTS_STATUS_UNKNOWN
 
     normalized_detail_url = normalize_detail_url(detail_url) or detail_url
-    written_at, attachments, body_blocks, _signals = fetch_detail_metadata_from_url(
+    written_at, attachments, body_blocks, signals = fetch_detail_metadata_from_url(
         normalized_detail_url
     )
+    attachment_status = classify_attachment_status_from_signals(attachments, signals)
     if not wait_for_written_at(page):
         LOGGER.info("작성일 로드 대기 실패: %s", detail_url)
+    html_text = page.content()
     if not written_at:
         written_at = extract_written_at_from_page(page)
         if not written_at:
-            written_at = extract_written_at_from_detail(page.content())
+            written_at = extract_written_at_from_detail(html_text)
     page_attachments = extract_attachments_from_page(page)
     if page_attachments:
         attachments = page_attachments
     elif not attachments:
-        attachments = extract_attachments_from_detail(page.content())
-    page_blocks = extract_body_blocks_from_html(page.content())
+        attachments = extract_attachments_from_detail(html_text)
+    page_blocks = extract_body_blocks_from_html(html_text)
     if page_blocks:
         body_blocks = page_blocks
+    attachment_status = classify_attachment_status_from_signals(
+        attachments,
+        build_detail_signals(html_text),
+    )
     if attachments and body_blocks:
         body_blocks = replace_body_image_urls(body_blocks, attachments)
     return_to_list_page(page, list_url)
-    return written_at, normalized_detail_url, attachments, body_blocks
+    return written_at, normalized_detail_url, attachments, body_blocks, attachment_status
 
 
 def goto_list_page(page, url: str) -> bool:
@@ -1332,6 +1472,7 @@ def crawl_top_items_api(
             fallback_written_at: Optional[str] = None
             fallback_attachments: list[dict] = []
             fallback_body_blocks: list[dict] = []
+            fallback_attachment_status = ATTACHMENTS_STATUS_UNKNOWN
             fallback_reason = get_detail_html_fallback_reason(
                 detail,
                 entry_title=str(entry.get("title") or ""),
@@ -1343,6 +1484,7 @@ def crawl_top_items_api(
                     fallback_attachments,
                     fallback_body_blocks,
                     detail_fetch_status,
+                    fallback_attachment_status,
                 ) = fetch_detail_metadata_with_html_fallback(
                     pk_id,
                     detail_url,
@@ -1367,6 +1509,12 @@ def crawl_top_items_api(
             attachments = extract_attachments_from_api_data(detail_data or entry)
             if not attachments and fallback_attachments:
                 attachments = fallback_attachments
+            attachment_status = classify_attachment_status_from_api_detail(
+                detail_data,
+                attachments,
+                fallback_reason,
+                fallback_attachment_status,
+            )
             content_html = detail_data.get("content") or ""
             body_blocks = extract_body_blocks_from_html(content_html) if content_html else []
             if not body_blocks and fallback_body_blocks:
@@ -1390,10 +1538,7 @@ def crawl_top_items_api(
             if classification:
                 item["classification"] = classification
             ensure_item_title(item, body_blocks, detail_url)
-            if attachments:
-                attachments = cap_attachments(attachments, item["title"])
-                item["attachments"] = attachments
-                log_attachments(item["title"], attachments)
+            apply_item_attachments(item, attachments, attachment_status)
 
             key = detail_url or f"{item['title']}|{written_at or ''}"
             if key in seen:
@@ -1477,12 +1622,14 @@ def crawl_top_items_playwright(
                 for item in items_to_process:
                     body_blocks: list[dict] = []
                     attachments: list[dict] = []
-                    written_at, detail_url, attachments, body_blocks = fetch_detail_for_row(
-                        page,
-                        url,
-                        item["row_index"],
-                        item.get("detail_url"),
-                        config_fk,
+                    (
+                        written_at,
+                        detail_url,
+                        attachments,
+                        body_blocks,
+                        attachment_status,
+                    ) = fetch_detail_for_row(
+                        page, url, item["row_index"], item.get("detail_url"), config_fk
                     )
                     if written_at:
                         item["date"] = written_at
@@ -1501,10 +1648,7 @@ def crawl_top_items_playwright(
                             item["title"],
                             detail_url or "URL없음",
                         )
-                    if attachments:
-                        attachments = cap_attachments(attachments, item["title"])
-                        item["attachments"] = attachments
-                        log_attachments(item["title"], attachments)
+                    apply_item_attachments(item, attachments, attachment_status)
                     key = item.get("url") or f"{item['title']}|{item.get('date') or ''}"
                     if key in seen:
                         continue
@@ -1595,9 +1739,14 @@ def crawl_top_items_http(
         for item in items_to_process:
             body_blocks: list[dict] = []
             attachments: list[dict] = []
+            attachment_status = ATTACHMENTS_STATUS_UNKNOWN
             if item.get("url"):
-                written_at, attachments, body_blocks, _signals = fetch_detail_metadata_from_url(
+                written_at, attachments, body_blocks, signals = fetch_detail_metadata_from_url(
                     item["url"]
+                )
+                attachment_status = classify_attachment_status_from_signals(
+                    attachments,
+                    signals,
                 )
                 if written_at:
                     item["date"] = written_at
@@ -1606,10 +1755,7 @@ def crawl_top_items_http(
             if classification:
                 item["classification"] = classification
             ensure_item_title(item, body_blocks, item.get("url"))
-            if attachments:
-                attachments = cap_attachments(attachments, item["title"])
-                item["attachments"] = attachments
-                log_attachments(item["title"], attachments)
+            apply_item_attachments(item, attachments, attachment_status)
             key = item.get("url") or f"{item['title']}|{item.get('date') or ''}"
             if key in seen:
                 continue

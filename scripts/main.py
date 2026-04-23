@@ -204,8 +204,8 @@ def main() -> None:
             LOGGER.info("처리 시작: %s (상세=%s)", label, detail_status)
             try:
                 if has_attachments_property:
-                    # 기존에 첨부가 있던 페이지에서 이번 수집 결과가 "첨부 없음"일 때도 clear payload를 만들 수 있게,
-                    # 실제 런타임 루프에서 attachments 키를 항상 빈 리스트까지 포함하도록 정규화한다.
+                    # 첨부가 "확정적으로 없음"일 때만 files=[]를 만들고,
+                    # 추출 실패처럼 미확인 상태면 기존 Notion 첨부를 보존한다.
                     normalize_item_attachments(item)
                 existing_page = find_existing_page(
                     notion_token,
@@ -263,7 +263,7 @@ def main() -> None:
                         )
                 attachment_count = len(item.get("attachments") or [])
                 attachment_state: list[dict] = []
-                if upload_files and has_attachments_property:
+                if upload_files and has_attachments_property and "attachments" in item:
                     reusable_uploaded_attachments = (
                         extract_existing_uploaded_attachment_ids(
                             existing_page.get("properties", {}) if existing_page else {},
@@ -335,7 +335,9 @@ def main() -> None:
                             )
                         )
                     }
-                if has_attachment_state_property:
+                # 첨부 상태도 확인된 첨부 목록이 있을 때만 갱신해야,
+                # 추출 실패 항목이 기존 재사용 상태를 []로 덮어쓰지 않는다.
+                if has_attachment_state_property and "attachments" in item:
                     if page_id and attachment_state:
                         attachment_state = enrich_attachment_state_with_page(
                             notion_token,

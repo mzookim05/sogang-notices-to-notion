@@ -20,6 +20,11 @@ from utils import (
     parse_int,
 )
 
+# 첨부가 "진짜 없음"인지 "이번 실행에서 확인 실패"인지 구분해야
+# Notion files 속성을 실수로 비우는 일을 막을 수 있다.
+ATTACHMENTS_STATUS_KNOWN = "known"
+ATTACHMENTS_STATUS_UNKNOWN = "unknown"
+
 
 # 상세 ID와 URL 판별 규칙은 HTML 파서와 Playwright 수집기가 같은 기준을 써야 하므로 공통 모듈로 모은다.
 def extract_detail_id_from_text(text: str) -> Optional[str]:
