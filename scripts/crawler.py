@@ -852,6 +852,37 @@ def run_attachment_policy_selftest() -> None:
             ):
                 raise RuntimeError("첨부 업로드 셀프테스트 실패(.pdf sg 신호 감지)")
 
+            api_sg_pdf_detail = {
+                "title": "첨부 API 테스트",
+                "regDate": "20260423120000",
+                "content": sg_pdf_html,
+            }
+            api_sg_pdf_reason = get_detail_html_fallback_reason(
+                api_sg_pdf_detail,
+                entry_title="첨부 API 테스트",
+            )
+            api_sg_pdf_status = classify_attachment_status_from_api_detail(
+                api_sg_pdf_detail,
+                [],
+                api_sg_pdf_reason,
+                ATTACHMENTS_STATUS_UNKNOWN,
+            )
+            api_sg_pdf_item = {"title": "첨부 API 테스트", "top": False}
+            apply_item_attachments(api_sg_pdf_item, [], api_sg_pdf_status)
+            sync_module.normalize_item_attachments(api_sg_pdf_item)
+            if (
+                "attachment_missing" not in str(api_sg_pdf_reason or "")
+                or api_sg_pdf_status != ATTACHMENTS_STATUS_UNKNOWN
+                or sync_module.build_properties(
+                    api_sg_pdf_item,
+                    has_views_property=False,
+                    has_attachments_property=True,
+                    has_classification_property=False,
+                ).get("첨부파일")
+                is not None
+            ):
+                raise RuntimeError("첨부 업로드 셀프테스트 실패(API content 첨부 보존)")
+
             # 재사용 후보 조회는 최적화일 뿐이므로, 루트 컨테이너 조회 실패가 항목 전체 실패로 번지지 않고
             # 새 업로드 경로로 자연스럽게 되돌아가는지 확인한다.
             def fake_top_level_failure(_token: str, _page_id: str):
@@ -967,7 +998,7 @@ def classify_attachment_status_from_api_detail(
 
     content_html = str(detail.get("content") or "")
     has_attachment_hint = bool(
-        content_html and ATTACHMENT_LINK_PATTERN.search(content_html)
+        content_html and detect_attachment_evidence_from_html(content_html)
     )
     has_file_value = any(
         str(detail.get(f"fileValue{idx}") or "").strip() for idx in range(1, 6)
@@ -1162,7 +1193,13 @@ def get_detail_html_fallback_reason(
     if not body_blocks:
         reasons.append("body_missing")
     attachments = extract_attachments_from_api_data(detail)
-    if not attachments and content_html and ATTACHMENT_LINK_PATTERN.search(content_html):
+    if (
+        not attachments
+        and content_html
+        and detect_attachment_evidence_from_html(content_html)
+    ):
+        # API content 안의 링크형 첨부도 HTML 수집 경로와 같은 후보 기준으로 봐야
+        # .pdf?sg=... 첨부가 fallback 없이 빈 첨부로 확정되는 일을 막을 수 있다.
         reasons.append("attachment_missing")
     if not reasons:
         return None
